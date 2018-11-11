@@ -306,7 +306,7 @@ def run_bottleneck_on_image(sess, image_data, image_data_tensor,
   # Then run it through the recognition network.
   bottleneck_values = sess.run(bottleneck_tensor,
                                {resized_input_tensor: resized_input_values})
-  bottleneck_values = np.squeeze(bottleneck_values)
+  bottleneck_values = np.ravel(bottleneck_values)
   return bottleneck_values
 
 
@@ -840,7 +840,7 @@ def prepare_file_system():
   return
 
 
-def create_model_info(architecture):
+def create_model_info(architecture, bottleneck_tensor_name='pool_3/_reshape:0'):
   """Given the name of a model architecture, returns information about it.
 
   There are different base image recognition pretrained models that can be
@@ -856,14 +856,14 @@ def create_model_info(architecture):
 
   Raises:
     ValueError: If architecture name is unknown.
+    :param bottleneck_tensor_size:
+    :param bottleneck_tensor_name:
   """
   architecture = architecture.lower()
   if architecture == 'inception_v3':
     # pylint: disable=line-too-long
     data_url = 'http://download.tensorflow.org/models/image/imagenet/inception-2015-12-05.tgz'
     # pylint: enable=line-too-long
-    bottleneck_tensor_name = 'pool_3/_reshape:0'
-    bottleneck_tensor_size = 2048
     input_width = 299
     input_height = 299
     input_depth = 3
@@ -925,7 +925,6 @@ def create_model_info(architecture):
   return {
       'data_url': data_url,
       'bottleneck_tensor_name': bottleneck_tensor_name,
-      'bottleneck_tensor_size': bottleneck_tensor_size,
       'input_width': input_width,
       'input_height': input_height,
       'input_depth': input_depth,
@@ -964,6 +963,9 @@ def add_jpeg_decoding(input_width, input_height, input_depth, input_mean,
   return jpeg_data, mul_image
 
 
+def flat(bottleneck_tensor):
+    return tf.layers.flatten(bottleneck_tensor)
+
 def main(_):
   # Needed to make sure the logging output is visible.
   # See https://github.com/tensorflow/tensorflow/issues/3047
@@ -973,7 +975,8 @@ def main(_):
   prepare_file_system()
 
   # Gather information about the model architecture we'll be using.
-  model_info = create_model_info(FLAGS.architecture)
+  model_info = create_model_info(FLAGS.architecture, bottleneck_tensor_name='mixed/tower_2/pool:0')
+
   if not model_info:
     tf.logging.error('Did not recognize architecture flag')
     return -1
@@ -982,6 +985,7 @@ def main(_):
   maybe_download_and_extract(model_info['data_url'])
   graph, bottleneck_tensor, resized_image_tensor = (
       create_model_graph(model_info))
+  flattened_bottleneck_tensor = flat(bottleneck_tensor)
 
   # Look at the folder structure, and create lists of all the images.
   image_lists = create_image_lists(FLAGS.image_dir, FLAGS.testing_percentage,
@@ -1022,13 +1026,13 @@ def main(_):
       cache_bottlenecks(sess, image_lists, FLAGS.image_dir,
                         FLAGS.bottleneck_dir, jpeg_data_tensor,
                         decoded_image_tensor, resized_image_tensor,
-                        bottleneck_tensor, FLAGS.architecture)
-
+                        flattened_bottleneck_tensor, FLAGS.architecture)
+    my_shape = flattened_bottleneck_tensor.get_shape()
     # Add the new layer that we'll be training.
     (train_step, cross_entropy, bottleneck_input, ground_truth_input,
      final_tensor) = add_final_training_ops(
-         len(image_lists.keys()), FLAGS.final_tensor_name, bottleneck_tensor,
-         model_info['bottleneck_tensor_size'])
+         len(image_lists.keys()), FLAGS.final_tensor_name, flattened_bottleneck_tensor,
+         int(flattened_bottleneck_tensor.get_shape()[1]))
 
     # Create the operations we need to evaluate the accuracy of our new layer.
     evaluation_step, prediction = add_evaluation_step(
@@ -1055,13 +1059,13 @@ def main(_):
          train_ground_truth) = get_random_distorted_bottlenecks(
              sess, image_lists, FLAGS.train_batch_size, 'training',
              FLAGS.image_dir, distorted_jpeg_data_tensor,
-             distorted_image_tensor, resized_image_tensor, bottleneck_tensor)
+             distorted_image_tensor, resized_image_tensor, flattened_bottleneck_tensor)
       else:
         (train_bottlenecks,
          train_ground_truth, _) = get_random_cached_bottlenecks(
              sess, image_lists, FLAGS.train_batch_size, 'training',
              FLAGS.bottleneck_dir, FLAGS.image_dir, jpeg_data_tensor,
-             decoded_image_tensor, resized_image_tensor, bottleneck_tensor,
+             decoded_image_tensor, resized_image_tensor, flattened_bottleneck_tensor,
              FLAGS.architecture)
       # Feed the bottlenecks and ground truth into the graph, and run a training
       # step. Capture training summaries for TensorBoard with the `merged` op.
@@ -1086,7 +1090,7 @@ def main(_):
             get_random_cached_bottlenecks(
                 sess, image_lists, FLAGS.validation_batch_size, 'validation',
                 FLAGS.bottleneck_dir, FLAGS.image_dir, jpeg_data_tensor,
-                decoded_image_tensor, resized_image_tensor, bottleneck_tensor,
+                decoded_image_tensor, resized_image_tensor, flattened_bottleneck_tensor,
                 FLAGS.architecture))
         # Run a validation step and capture training summaries for TensorBoard
         # with the `merged` op.
@@ -1116,7 +1120,7 @@ def main(_):
         get_random_cached_bottlenecks(
             sess, image_lists, FLAGS.test_batch_size, 'testing',
             FLAGS.bottleneck_dir, FLAGS.image_dir, jpeg_data_tensor,
-            decoded_image_tensor, resized_image_tensor, bottleneck_tensor,
+            decoded_image_tensor, resized_image_tensor, flattened_bottleneck_tensor,
             FLAGS.architecture))
     test_accuracy, predictions = sess.run(
         [evaluation_step, prediction],
