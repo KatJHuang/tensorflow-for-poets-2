@@ -122,6 +122,8 @@ FLAGS = None
 MAX_NUM_IMAGES_PER_CLASS = 2 ** 27 - 1  # ~134M
 
 
+
+
 def create_image_lists(image_dir, testing_percentage, validation_percentage):
   """Builds a list of training images from the file system.
 
@@ -824,6 +826,18 @@ def add_evaluation_step(result_tensor, ground_truth_tensor):
       evaluation_step = tf.reduce_mean(tf.cast(correct_prediction, tf.float32))
   tf.summary.scalar('accuracy', evaluation_step)
   return evaluation_step, prediction
+
+
+def get_prediction(result_tensor):
+  """
+  Inserts an operation to get the prediction for a single output
+
+  :param result_tensor: The new final node that produces results.
+  :return: a tensor for prediction
+  """
+  with tf.name_scope('prediction'):
+    prediction = tf.argmax(result_tensor, 1)
+  return prediction
 
 
 def save_graph_to_file(sess, graph, graph_file_name):
