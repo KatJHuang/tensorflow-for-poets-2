@@ -103,6 +103,7 @@ import random
 import re
 import sys
 import tarfile
+from pathlib import Path
 
 import numpy as np
 from six.moves import urllib
@@ -114,6 +115,12 @@ from tensorflow.python.platform import gfile
 from tensorflow.python.util import compat
 
 FLAGS = None
+
+CATEGORIES = {
+    'training': 0,
+    'validation': 1,
+    'testing': 2
+}
 
 # These are all parameters that are tied to the particular model architecture
 # we're using for Inception v3. These include things like tensor names and their
@@ -376,6 +383,182 @@ def create_bottleneck_file(bottleneck_path, image_lists, label_name, index,
     bottleneck_string = ','.join(str(x) for x in bottleneck_values)
     with open(bottleneck_path, 'w') as bottleneck_file:
         bottleneck_file.write(bottleneck_string)
+
+
+def compute_bottleneck(sess, image_data,
+                       jpeg_data_tensor, decoded_image_tensor,
+                       resized_input_tensor, bottleneck_tensor):
+    """
+    Compute values of bottleneck tensors given image data
+    :param sess:
+    :param image_data:
+    :param jpeg_data_tensor:
+    :param decoded_image_tensor:
+    :param resized_input_tensor:
+    :param bottleneck_tensor:
+    :return: a list of floats
+    """
+    try:
+        bottleneck_values = run_bottleneck_on_image(
+            sess, image_data, jpeg_data_tensor, decoded_image_tensor,
+            resized_input_tensor, bottleneck_tensor)
+    except Exception as e:
+        raise RuntimeError('Error during computing bottleneck: {}'.format(e))
+    return bottleneck_values
+
+
+def _floats_feature(values):
+    """
+    Put the bottleneck values for each image in a TF feature list
+    :param values: list of floats
+    :return: tf.train.Feature of type float_list
+    """
+    return tf.train.Feature(float_list=tf.train.FloatList(value=values))
+
+
+def _bytes_feature(value):
+  """Returns a bytes_list from a string / byte."""
+  return tf.train.Feature(bytes_list=tf.train.BytesList(value=value))
+
+
+def _int64_feature(value):
+  """Returns an int64_list from a bool / enum / int / uint."""
+  return tf.train.Feature(int64_list=tf.train.Int64List(value=[value]))
+
+
+def write_bottlenecks_to_tfrecords(sess, bottleneck_dir, image_data_lists,
+                                   jpeg_data_tensor, decoded_image_tensor,
+                                   resized_input_tensor, bottleneck_tensor):
+    """
+    Save serialized bottleneck values into TF records
+
+    :param sess:
+    :param tfrecords_filename:
+    :param image_data_lists: WHAT DOES THIS CONTAIN AGAIN...
+    :param jpeg_data_tensor:
+    :param decoded_image_tensor:
+    :param resized_input_tensor:
+    :param bottleneck_tensor:
+    :return:
+    """
+    filename = str(Path(bottleneck_dir) / Path("bottlenecks.tfrecords"))
+    writer = tf.python_io.TFRecordWriter(filename)
+
+    how_many_bottlenecks = 0
+    ensure_dir_exists(bottleneck_dir)
+
+    class_count = len(image_data_lists.keys())
+
+    for label_index, label_name in enumerate(image_data_lists.keys()):
+        for _, category in CATEGORIES.items():
+            for image_index, image_data in enumerate(
+                    image_data_lists[label_name][category]):
+                bottleneck_values = compute_bottleneck(sess, image_data,
+                                                       jpeg_data_tensor, decoded_image_tensor,
+                                                       resized_input_tensor, bottleneck_tensor)
+
+                ground_truth = np.zeros(class_count, dtype=np.float32)
+                ground_truth[label_index] = 1.0
+
+                example = tf.train.Example(features=tf.train.Features(feature={
+                    "image_index": _int64_feature(image_index),
+                    "bottleneck": _floats_feature(bottleneck_values),
+                    "ground_truth": _floats_feature(ground_truth),
+                    "category": _int64_feature(category)
+                }))
+
+                writer.write(example.SerializeToString())
+
+                how_many_bottlenecks += 1
+                if how_many_bottlenecks % 100 == 0:
+                    tf.logging.info(
+                        str(how_many_bottlenecks) + ' bottleneck entries created.')
+    writer.close()
+
+
+def retrieve_bottlenecks_from_tfrecords(sess, bottleneck_dir):
+    """
+    Retrieve certain number of random samples from the training/test/validation set
+    :param bottleneck_dir:
+    :param category: train/test/validation
+    :param how_many: number of samples
+    :return:
+    """
+    def extract_fn(data_record):
+        feature_set = {
+            "image_index": tf.FixedLenFeature(shape=[], dtype=tf.int64),
+            "bottleneck": tf.FixedLenSequenceFeature(shape=[],
+                                                     allow_missing=True,
+                                                     dtype=tf.float32),
+            "ground_truth": tf.FixedLenSequenceFeature(shape=[],
+                                                       allow_missing=True,
+                                                       dtype=tf.float32),
+            "category": tf.FixedLenFeature(shape=[], dtype=tf.int64)
+        }
+        while True:
+            return tf.parse_single_example(data_record, feature_set)
+
+    bottleneck_file = str(Path(bottleneck_dir) / Path("bottlenecks.tfrecords"))
+    annotated_bottlenecks = collections.OrderedDict()
+
+    dataset = tf.data.TFRecordDataset([bottleneck_file])
+    dataset = dataset.map(extract_fn)
+    iterator = dataset.make_one_shot_iterator()
+
+    next_element = iterator.get_next()
+
+    # Adding a try-except block because TFRecordDataset tends to throw OutOfRange error
+    # when reaching the end of example sequences and stops the program; here we let it
+    # silently pass
+    #
+    # Sources:
+    # https://medium.com/ymedialabs-innovation/how-to-use-tfrecord-with-datasets-and-iterators-in-tensorflow-with-code-samples-ffee57d298af
+    try:
+        while True:
+            data_record = sess.run(next_element)
+
+            bottleneck = data_record["bottleneck"]
+            category = data_record["category"]
+            ground_truth = data_record["ground_truth"]
+
+            label = ground_truth.argmax()
+
+            if label not in annotated_bottlenecks.keys():
+                annotated_bottlenecks[label] = {}
+
+            if category not in annotated_bottlenecks[label].keys():
+                annotated_bottlenecks[label][category] = []
+
+            annotated_bottlenecks[label][category].append((bottleneck, ground_truth))
+    except:
+        pass
+
+    return annotated_bottlenecks
+
+
+def retrieve_random_bottlenecks(annotated_bottlenecks, category, how_many):
+    """
+
+    :param annotated_bottlenecks: an embedded dict of bottlenecks indexed by label and category
+    (as in train/validate/test)
+    :param category:
+    :param how_many:
+    :return:
+    """
+    class_count = len(annotated_bottlenecks.keys())
+
+    bottlenecks = []
+    ground_truths = []
+
+    for unused_i in range(how_many):
+        label_index = list(annotated_bottlenecks.keys())[random.randrange(class_count)]
+        image_index = random.randrange(len(annotated_bottlenecks[label_index][category]))
+
+        bottleneck, ground_truth = annotated_bottlenecks[label_index][category][image_index]
+        bottlenecks.append(bottleneck)
+        ground_truths.append(ground_truth)
+
+    return bottlenecks, ground_truths
 
 
 def get_or_create_bottleneck(sess, image_lists, label_name, index, image_dir,
@@ -982,6 +1165,31 @@ def add_jpeg_decoding(input_width, input_height, input_depth, input_mean,
     return jpeg_data, mul_image
 
 
+# ========================================================================
+# ========================================================================
+def get_image_data_lists(image_lists, image_dir):
+    """
+    TEMPORARY FUNCTION FOR DEBUG PURPOSES
+    :param image_lists:
+    :return:
+    """
+    image_data_lists = collections.OrderedDict()
+
+    for label_name, label_lists in image_lists.items():
+        image_data_lists[label_name] = collections.OrderedDict()
+        for category_str, category_int in CATEGORIES.items():
+            image_data_lists[label_name][category_int] = []
+
+            category_list = label_lists[category_str]
+            for index, unused_base_name in enumerate(category_list):
+                image_name = get_image_path(image_lists, label_name, index, image_dir, category_str)
+                image_data = gfile.FastGFile(image_name, 'rb').read()
+                image_data_lists[label_name][category_int].append(image_data)
+    return image_data_lists
+# ========================================================================
+# ========================================================================
+
+
 def main(_):
     # Needed to make sure the logging output is visible.
     # See https://github.com/tensorflow/tensorflow/issues/3047
@@ -1004,6 +1212,8 @@ def main(_):
     # Look at the folder structure, and create lists of all the images.
     image_lists = create_image_lists(FLAGS.image_dir, FLAGS.testing_percentage,
                                      FLAGS.validation_percentage)
+    image_data_lists = get_image_data_lists(image_lists, FLAGS.image_dir)
+
     class_count = len(image_lists.keys())
     if class_count == 0:
         tf.logging.error('No valid folders of images found at ' + FLAGS.image_dir)
@@ -1037,10 +1247,9 @@ def main(_):
         else:
             # We'll make sure we've calculated the 'bottleneck' image summaries and
             # cached them on disk.
-            cache_bottlenecks(sess, image_lists, FLAGS.image_dir,
-                              FLAGS.bottleneck_dir, jpeg_data_tensor,
-                              decoded_image_tensor, resized_image_tensor,
-                              bottleneck_tensor, FLAGS.architecture)
+            write_bottlenecks_to_tfrecords(sess, FLAGS.bottleneck_dir, image_data_lists,
+                                           jpeg_data_tensor, decoded_image_tensor,
+                                           resized_image_tensor, bottleneck_tensor)
 
         # Add the new layer that we'll be training.
         (train_step, cross_entropy, bottleneck_input, ground_truth_input,
@@ -1064,6 +1273,8 @@ def main(_):
         init = tf.global_variables_initializer()
         sess.run(init)
 
+        annotated_bottlenecks = retrieve_bottlenecks_from_tfrecords(sess, FLAGS.bottleneck_dir)
+
         # Run the training for as many cycles as requested on the command line.
         for i in range(FLAGS.how_many_training_steps):
             # Get a batch of input bottleneck values, either calculated fresh every
@@ -1075,19 +1286,18 @@ def main(_):
                     FLAGS.image_dir, distorted_jpeg_data_tensor,
                     distorted_image_tensor, resized_image_tensor, bottleneck_tensor)
             else:
-                (train_bottlenecks,
-                 train_ground_truth, _) = get_random_cached_bottlenecks(
-                    sess, image_lists, FLAGS.train_batch_size, 'training',
-                    FLAGS.bottleneck_dir, FLAGS.image_dir, jpeg_data_tensor,
-                    decoded_image_tensor, resized_image_tensor, bottleneck_tensor,
-                    FLAGS.architecture)
+                train_bottlenecks_tf, train_ground_truth_tf = retrieve_random_bottlenecks(annotated_bottlenecks,
+                                                                                          CATEGORIES['training'],
+                                                                                          FLAGS.train_batch_size)
+
             # Feed the bottlenecks and ground truth into the graph, and run a training
             # step. Capture training summaries for TensorBoard with the `merged` op.
             train_summary, _ = sess.run(
                 [merged, train_step],
-                feed_dict={bottleneck_input: train_bottlenecks,
-                           ground_truth_input: train_ground_truth,
+                feed_dict={bottleneck_input: train_bottlenecks_tf,
+                           ground_truth_input: train_ground_truth_tf,
                            keep_prob: 0.5})
+
             train_writer.add_summary(train_summary, i)
 
             # Every so often, print out how well the graph is training.
@@ -1095,8 +1305,8 @@ def main(_):
             if (i % FLAGS.eval_step_interval) == 0 or is_last_step:
                 train_accuracy, cross_entropy_value = sess.run(
                     [evaluation_step, cross_entropy],
-                    feed_dict={bottleneck_input: train_bottlenecks,
-                               ground_truth_input: train_ground_truth,
+                    feed_dict={bottleneck_input: train_bottlenecks_tf,
+                               ground_truth_input: train_ground_truth_tf,
                                keep_prob: 0.5})
                 tf.logging.info('%s: Step %d: Train accuracy = %.1f%%' %
                                 (datetime.now(), i, train_accuracy * 100))
@@ -1108,12 +1318,14 @@ def main(_):
                         FLAGS.bottleneck_dir, FLAGS.image_dir, jpeg_data_tensor,
                         decoded_image_tensor, resized_image_tensor, bottleneck_tensor,
                         FLAGS.architecture))
+                validation_bottlenecks_tf, validation_ground_truth_tf = retrieve_random_bottlenecks(
+                    annotated_bottlenecks, CATEGORIES['validation'], FLAGS.train_batch_size)
                 # Run a validation step and capture training summaries for TensorBoard
                 # with the `merged` op.
                 validation_summary, validation_accuracy = sess.run(
                     [merged, evaluation_step],
-                    feed_dict={bottleneck_input: validation_bottlenecks,
-                               ground_truth_input: validation_ground_truth,
+                    feed_dict={bottleneck_input: validation_bottlenecks_tf,
+                               ground_truth_input: validation_ground_truth_tf,
                                keep_prob: 1.0})
                 validation_writer.add_summary(validation_summary, i)
                 tf.logging.info('%s: Step %d: Validation accuracy = %.1f%% (N=%d)' %
@@ -1133,27 +1345,25 @@ def main(_):
 
         # We've completed all our training, so run a final test evaluation on
         # some new images we haven't used before.
-        test_bottlenecks, test_ground_truth, test_filenames = (
-            get_random_cached_bottlenecks(
-                sess, image_lists, FLAGS.test_batch_size, 'testing',
-                FLAGS.bottleneck_dir, FLAGS.image_dir, jpeg_data_tensor,
-                decoded_image_tensor, resized_image_tensor, bottleneck_tensor,
-                FLAGS.architecture))
+        test_bottlenecks_tf, test_ground_truth_tf=retrieve_random_bottlenecks(annotated_bottlenecks,
+                                                                              CATEGORIES['testing'],
+                                                                              FLAGS.train_batch_size)
         test_accuracy, predictions = sess.run(
             [evaluation_step, prediction],
-            feed_dict={bottleneck_input: test_bottlenecks,
-                       ground_truth_input: test_ground_truth,
+            feed_dict={bottleneck_input: test_bottlenecks_tf,
+                       ground_truth_input: test_ground_truth_tf,
                        keep_prob: 1.0})
+
         tf.logging.info('Final test accuracy = %.1f%% (N=%d)' %
-                        (test_accuracy * 100, len(test_bottlenecks)))
+                        (test_accuracy * 100, len(test_bottlenecks_tf)))
 
         if FLAGS.print_misclassified_test_images:
             tf.logging.info('=== MISCLASSIFIED TEST IMAGES ===')
-            for i, test_filename in enumerate(test_filenames):
-                if predictions[i] != test_ground_truth[i].argmax():
-                    tf.logging.info('%70s  %s' %
-                                    (test_filename,
-                                     list(image_lists.keys())[predictions[i]]))
+            # for i, test_filename in enumerate(test_filenames):
+            #     if predictions[i] != test_ground_truth[i].argmax():
+            #         tf.logging.info('%70s  %s' %
+            #                         (test_filename,
+            #                          list(image_lists.keys())[predictions[i]]))
 
         # Write out the trained graph and labels with the weights stored as
         # constants.
